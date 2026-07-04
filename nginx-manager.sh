@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # =========================================
-#          NGINX MANAGER v2.0
+#          NGINX MANAGER v2.1
+#       (Nginx + SSH Management)
 # =========================================
 
 # Warna untuk output terminal
@@ -66,6 +67,54 @@ safe_reload_nginx() {
     else
         echo -e "${RED}Error: Konfigurasi Nginx tidak valid! Reload dibatalkan.${NC}"
         nginx -t
+        return 1
+    fi
+}
+
+# =========================================
+# HELPER: Nama service SSH (ssh atau sshd
+# tergantung distro), dideteksi sekali saja
+# =========================================
+get_ssh_service() {
+    if systemctl list-unit-files 2>/dev/null | grep -q "^ssh.service"; then
+        echo "ssh"
+    elif systemctl list-unit-files 2>/dev/null | grep -q "^sshd.service"; then
+        echo "sshd"
+    else
+        echo "ssh"
+    fi
+}
+
+# PERBAIKAN: Fungsi validasi nomor port SSH
+validate_ssh_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Error: Port harus berupa angka!${NC}"
+        return 1
+    fi
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "${RED}Error: Port harus antara 1-65535!${NC}"
+        return 1
+    fi
+    return 0
+}
+
+# PERBAIKAN: Fungsi test syntax sshd_config sebelum restart
+safe_restart_ssh() {
+    local service_name
+    service_name=$(get_ssh_service)
+    if sshd -t 2>/tmp/sshd_test_err; then
+        systemctl restart "$service_name"
+        if systemctl is-active --quiet "$service_name"; then
+            return 0
+        else
+            echo -e "${RED}Error: Service SSH gagal start setelah restart!${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}Error: Konfigurasi sshd_config tidak valid! Restart dibatalkan.${NC}"
+        cat /tmp/sshd_test_err
+        rm -f /tmp/sshd_test_err
         return 1
     fi
 }
@@ -733,11 +782,231 @@ remove_website() {
 }
 
 # =========================================
-# 16. Uninstall Nginx (Clean)
+# 16. Install SSH
+# =========================================
+install_ssh() {
+    clear
+    echo -e "${YELLOW}[16] Menginstall OpenSSH Server...${NC}"
+    echo "========================================="
+
+    if command -v sshd &>/dev/null; then
+        echo -e "${YELLOW}OpenSSH Server sudah terinstall. Versi:${NC}"
+        sshd -V 2>&1 | head -n 1
+        read -p "Reinstall? (y/n): " reinstall
+        if [ "$reinstall" != "y" ] && [ "$reinstall" != "Y" ]; then
+            echo -e "${YELLOW}Instalasi dibatalkan.${NC}"
+            pause
+            return
+        fi
+    fi
+
+    apt update -y
+    apt install -y openssh-server
+
+    if ! command -v sshd &>/dev/null; then
+        echo -e "${RED}Gagal menginstall OpenSSH Server. Periksa koneksi internet atau repository.${NC}"
+        pause
+        return
+    fi
+
+    local service_name
+    service_name=$(get_ssh_service)
+    systemctl enable "$service_name"
+    systemctl start "$service_name"
+
+    echo -e "${GREEN}OpenSSH Server berhasil diinstall dan dijalankan!${NC}"
+    echo -e "${CYAN}Service: $service_name${NC}"
+    echo -e "${CYAN}Versi  : $(sshd -V 2>&1 | head -n 1)${NC}"
+
+    # PERBAIKAN: Ingatkan untuk cek firewall
+    if command -v ufw &>/dev/null; then
+        echo ""
+        echo -e "${YELLOW}Terdeteksi UFW. Pastikan port SSH diizinkan, contoh: ufw allow 22/tcp${NC}"
+    fi
+    pause
+}
+
+# =========================================
+# 17. Konfigurasi SSH Lengkap
+# =========================================
+configure_ssh() {
+    clear
+    echo -e "${YELLOW}[17] Konfigurasi SSH Lengkap${NC}"
+    echo "========================================="
+
+    if ! command -v sshd &>/dev/null; then
+        echo -e "${RED}OpenSSH Server belum terinstall! Install dulu (menu [16]).${NC}"
+        pause
+        return
+    fi
+
+    local SSHD_CONFIG="/etc/ssh/sshd_config"
+    if [ ! -f "$SSHD_CONFIG" ]; then
+        echo -e "${RED}File $SSHD_CONFIG tidak ditemukan!${NC}"
+        pause
+        return
+    fi
+
+    # PERBAIKAN: Backup sshd_config sebelum diubah
+    local BACKUP_DIR="/root/ssh_backups"
+    mkdir -p "$BACKUP_DIR"
+    local BACKUP_NAME="sshd_config-backup-$(date +%F-%H%M%S)"
+    cp "$SSHD_CONFIG" "$BACKUP_DIR/$BACKUP_NAME"
+    echo -e "${CYAN}Backup sshd_config disimpan di: $BACKUP_DIR/$BACKUP_NAME${NC}"
+    echo ""
+
+    # --- Port SSH ---
+    read -p "Ubah port SSH? Masukkan port baru (kosongkan untuk lewati): " ssh_port
+    if [ -n "$ssh_port" ]; then
+        if validate_ssh_port "$ssh_port"; then
+            sed -i '/^#\?Port /d' "$SSHD_CONFIG"
+            echo "Port $ssh_port" >> "$SSHD_CONFIG"
+            echo -e "${GREEN}Port SSH akan diubah ke $ssh_port${NC}"
+
+            if command -v ufw &>/dev/null; then
+                read -p "Izinkan port $ssh_port di UFW sekarang? (y/n): " allow_ufw
+                if [ "$allow_ufw" = "y" ] || [ "$allow_ufw" = "Y" ]; then
+                    ufw allow "$ssh_port"/tcp
+                fi
+            fi
+        else
+            echo -e "${YELLOW}Port tidak diubah karena tidak valid.${NC}"
+        fi
+    fi
+
+    # --- Root Login ---
+    echo ""
+    echo -e "${CYAN}Opsi PermitRootLogin: yes / no / prohibit-password${NC}"
+    read -p "Atur PermitRootLogin (kosongkan untuk lewati): " root_login
+    if [ -n "$root_login" ]; then
+        if [[ "$root_login" =~ ^(yes|no|prohibit-password)$ ]]; then
+            sed -i '/^#\?PermitRootLogin /d' "$SSHD_CONFIG"
+            echo "PermitRootLogin $root_login" >> "$SSHD_CONFIG"
+            echo -e "${GREEN}PermitRootLogin diatur ke: $root_login${NC}"
+        else
+            echo -e "${RED}Nilai tidak valid, dilewati.${NC}"
+        fi
+    fi
+
+    # --- Password Authentication ---
+    echo ""
+    read -p "Aktifkan Password Authentication? (y/n, kosongkan untuk lewati): " pass_auth
+    if [ "$pass_auth" = "y" ] || [ "$pass_auth" = "Y" ]; then
+        sed -i '/^#\?PasswordAuthentication /d' "$SSHD_CONFIG"
+        echo "PasswordAuthentication yes" >> "$SSHD_CONFIG"
+        echo -e "${GREEN}PasswordAuthentication diaktifkan.${NC}"
+    elif [ "$pass_auth" = "n" ] || [ "$pass_auth" = "N" ]; then
+        # PERBAIKAN: Peringatkan jika belum ada key based auth
+        if [ ! -f "/root/.ssh/authorized_keys" ] && [ "$root_login" != "no" ]; then
+            echo -e "${YELLOW}Peringatan: Tidak ditemukan /root/.ssh/authorized_keys.${NC}"
+            echo -e "${YELLOW}Menonaktifkan password auth tanpa SSH key bisa mengunci akses Anda!${NC}"
+            read -p "Tetap lanjutkan menonaktifkan Password Authentication? (y/n): " confirm_disable
+            if [ "$confirm_disable" != "y" ] && [ "$confirm_disable" != "Y" ]; then
+                echo -e "${YELLOW}Dilewati.${NC}"
+            else
+                sed -i '/^#\?PasswordAuthentication /d' "$SSHD_CONFIG"
+                echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
+                echo -e "${GREEN}PasswordAuthentication dinonaktifkan.${NC}"
+            fi
+        else
+            sed -i '/^#\?PasswordAuthentication /d' "$SSHD_CONFIG"
+            echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
+            echo -e "${GREEN}PasswordAuthentication dinonaktifkan.${NC}"
+        fi
+    fi
+
+    # --- Pubkey Authentication ---
+    echo ""
+    read -p "Aktifkan Pubkey Authentication? (y/n, kosongkan untuk lewati): " pubkey_auth
+    if [ "$pubkey_auth" = "y" ] || [ "$pubkey_auth" = "Y" ]; then
+        sed -i '/^#\?PubkeyAuthentication /d' "$SSHD_CONFIG"
+        echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
+        echo -e "${GREEN}PubkeyAuthentication diaktifkan.${NC}"
+    elif [ "$pubkey_auth" = "n" ] || [ "$pubkey_auth" = "N" ]; then
+        sed -i '/^#\?PubkeyAuthentication /d' "$SSHD_CONFIG"
+        echo "PubkeyAuthentication no" >> "$SSHD_CONFIG"
+        echo -e "${GREEN}PubkeyAuthentication dinonaktifkan.${NC}"
+    fi
+
+    # --- Max Auth Tries ---
+    echo ""
+    read -p "Atur MaxAuthTries (contoh: 3, kosongkan untuk lewati): " max_tries
+    if [ -n "$max_tries" ] && [[ "$max_tries" =~ ^[0-9]+$ ]]; then
+        sed -i '/^#\?MaxAuthTries /d' "$SSHD_CONFIG"
+        echo "MaxAuthTries $max_tries" >> "$SSHD_CONFIG"
+        echo -e "${GREEN}MaxAuthTries diatur ke: $max_tries${NC}"
+    fi
+
+    # --- Client Alive Interval (auto logout idle) ---
+    echo ""
+    read -p "Atur ClientAliveInterval detik, untuk auto-logout idle (kosongkan untuk lewati): " alive_interval
+    if [ -n "$alive_interval" ] && [[ "$alive_interval" =~ ^[0-9]+$ ]]; then
+        sed -i '/^#\?ClientAliveInterval /d' "$SSHD_CONFIG"
+        echo "ClientAliveInterval $alive_interval" >> "$SSHD_CONFIG"
+        sed -i '/^#\?ClientAliveCountMax /d' "$SSHD_CONFIG"
+        echo "ClientAliveCountMax 2" >> "$SSHD_CONFIG"
+        echo -e "${GREEN}ClientAliveInterval diatur ke: ${alive_interval}s${NC}"
+    fi
+
+    # --- Batasi user tertentu ---
+    echo ""
+    read -p "Batasi login SSH hanya untuk user tertentu? Masukkan username (pisahkan spasi, kosongkan untuk lewati): " allow_users
+    if [ -n "$allow_users" ]; then
+        sed -i '/^#\?AllowUsers /d' "$SSHD_CONFIG"
+        echo "AllowUsers $allow_users" >> "$SSHD_CONFIG"
+        echo -e "${GREEN}AllowUsers diatur ke: $allow_users${NC}"
+    fi
+
+    # --- Terapkan perubahan ---
+    echo ""
+    echo -e "${YELLOW}Menerapkan konfigurasi SSH...${NC}"
+    if safe_restart_ssh; then
+        echo -e "${GREEN}Konfigurasi SSH berhasil diterapkan!${NC}"
+        echo -e "${CYAN}Backup konfigurasi lama: $BACKUP_DIR/$BACKUP_NAME${NC}"
+        echo -e "${YELLOW}PENTING: Jangan tutup sesi SSH ini sebelum memverifikasi login baru berhasil di terminal lain!${NC}"
+    else
+        echo -e "${RED}Gagal menerapkan konfigurasi. Mengembalikan backup...${NC}"
+        cp "$BACKUP_DIR/$BACKUP_NAME" "$SSHD_CONFIG"
+        safe_restart_ssh
+        echo -e "${YELLOW}Konfigurasi dikembalikan ke kondisi semula.${NC}"
+    fi
+    pause
+}
+
+# =========================================
+# 18. Status SSH
+# =========================================
+status_ssh() {
+    clear
+    echo -e "${YELLOW}[18] Status Layanan SSH${NC}"
+    echo "========================================="
+
+    if ! command -v sshd &>/dev/null; then
+        echo -e "${RED}OpenSSH Server tidak terinstall.${NC}"
+        pause
+        return
+    fi
+
+    local service_name
+    service_name=$(get_ssh_service)
+    systemctl status "$service_name" --no-pager
+
+    echo ""
+    echo -e "${CYAN}Port SSH yang aktif:${NC}"
+    ss -tlnp 2>/dev/null | grep -i ssh || netstat -tlnp 2>/dev/null | grep -i ssh || echo "Tidak dapat mendeteksi port."
+
+    echo ""
+    echo -e "${CYAN}Pengaturan penting saat ini (sshd_config):${NC}"
+    grep -E "^(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|MaxAuthTries|AllowUsers|ClientAliveInterval) " /etc/ssh/sshd_config 2>/dev/null || echo "Menggunakan nilai default (tidak ada override eksplisit)."
+    pause
+}
+
+# =========================================
+# 19. Uninstall Nginx (Clean)
 # =========================================
 uninstall_nginx() {
     clear
-    echo -e "${RED}[16] Uninstall Nginx (Clean)${NC}"
+    echo -e "${RED}[19] Uninstall Nginx (Clean)${NC}"
     echo "========================================="
     echo -e "${RED}PERINGATAN! Ini akan menghapus Nginx dan SEMUA konfigurasinya secara permanen!${NC}"
     echo ""
@@ -767,12 +1036,61 @@ uninstall_nginx() {
 }
 
 # =========================================
+# 20. Uninstall SSH (Clean)
+# =========================================
+uninstall_ssh() {
+    clear
+    echo -e "${RED}[20] Uninstall SSH (Clean)${NC}"
+    echo "========================================="
+    echo -e "${RED}PERINGATAN SANGAT PENTING!${NC}"
+    echo -e "${RED}Menghapus SSH akan MEMUTUS akses jarak jauh ke server ini melalui SSH.${NC}"
+    echo -e "${RED}Jika ini satu-satunya cara Anda mengakses server (misal VPS tanpa console web),${NC}"
+    echo -e "${RED}Anda bisa terkunci total dari server setelah proses ini selesai!${NC}"
+    echo ""
+    echo -e "${YELLOW}Pastikan Anda memiliki akses alternatif (console provider, KVM, dsb) sebelum lanjut.${NC}"
+    echo ""
+
+    if ! command -v sshd &>/dev/null; then
+        echo -e "${YELLOW}OpenSSH Server tidak terdeteksi terinstall di sistem ini.${NC}"
+        pause
+        return
+    fi
+
+    read -p "Ketik 'HAPUS SSH' untuk konfirmasi: " konfirmasi
+    if [ "$konfirmasi" != "HAPUS SSH" ]; then
+        echo -e "${YELLOW}Proses uninstall dibatalkan.${NC}"
+        pause
+        return
+    fi
+
+    # PERBAIKAN: Backup konfigurasi SSH sebelum dihapus
+    echo -e "${YELLOW}Membuat backup terakhir konfigurasi SSH sebelum uninstall...${NC}"
+    BACKUP_DIR="/root/ssh_backups"
+    mkdir -p "$BACKUP_DIR"
+    tar -czf "$BACKUP_DIR/final-ssh-backup-$(date +%F-%H%M%S).tar.gz" /etc/ssh 2>/dev/null
+    echo -e "${CYAN}Backup tersimpan di $BACKUP_DIR${NC}"
+
+    local service_name
+    service_name=$(get_ssh_service)
+
+    systemctl stop "$service_name" 2>/dev/null
+    apt purge -y openssh-server
+    apt autoremove -y
+    rm -rf /etc/ssh
+
+    echo -e "${GREEN}OpenSSH Server berhasil dihapus dari sistem.${NC}"
+    echo -e "${CYAN}Backup konfigurasi tersimpan di: $BACKUP_DIR${NC}"
+    echo -e "${YELLOW}Ingat: sesi SSH yang sedang berjalan mungkin masih aktif sampai ditutup manual.${NC}"
+    pause
+}
+
+# =========================================
 # MAIN MENU LOOP
 # =========================================
 while true; do
     clear
     echo "========================================="
-    echo "           NGINX MANAGER v2.0            "
+    echo "           NGINX MANAGER v2.1            "
     echo "        $(date '+%Y-%m-%d %H:%M:%S')        "
     echo "========================================="
     echo ""
@@ -801,13 +1119,19 @@ while true; do
     echo -e " [14] List Website"
     echo -e " [15] Remove Website"
     echo ""
+    echo -e " ${GREEN}--- SSH Management ---${NC}"
+    echo -e " [16] Install SSH"
+    echo -e " [17] Konfigurasi SSH Lengkap"
+    echo -e " [18] Status SSH"
+    echo ""
     echo -e " ${RED}--- Danger Zone ---${NC}"
-    echo -e " [16] Uninstall Nginx (Clean)"
+    echo -e " [19] Uninstall Nginx (Clean)"
+    echo -e " [20] Uninstall SSH (Clean)"
     echo ""
     echo -e " [0]  Exit"
     echo ""
     echo "========================================="
-    read -p " Pilih menu [0-16]: " pilihan
+    read -p " Pilih menu [0-20]: " pilihan
     echo "========================================="
 
     case $pilihan in
@@ -826,15 +1150,19 @@ while true; do
         13) status_nginx ;;
         14) list_websites ;;
         15) remove_website ;;
-        16) uninstall_nginx ;;
+        16) install_ssh ;;
+        17) configure_ssh ;;
+        18) status_ssh ;;
+        19) uninstall_nginx ;;
+        20) uninstall_ssh ;;
         0)
             echo ""
-            echo -e "${GREEN}Terima kasih telah menggunakan Nginx Manager v2.0!${NC}"
+            echo -e "${GREEN}Terima kasih telah menggunakan Nginx Manager v2.1!${NC}"
             echo ""
             exit 0
             ;;
         *)
-            echo -e "${RED}Pilihan tidak valid! Silakan pilih antara 0-16.${NC}"
+            echo -e "${RED}Pilihan tidak valid! Silakan pilih antara 0-20.${NC}"
             sleep 2
             ;;
     esac
